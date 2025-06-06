@@ -1,0 +1,627 @@
+#include <HardwareSerial.h>
+#include <SPIFFS.h>
+#include "driver/i2s.h"
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEAdvertising.h>
+
+#define MODEM_RX 33  // ESP32 接收引脚（接模块 TXD）
+#define MODEM_TX 23  // ESP32 发送引脚（接模块 RXD）
+#define BAUD_RATE 115200
+
+HardwareSerial modemSerial(1);
+
+// 通用发送 AT 命令并打印返回
+void sendATCommand(const char* cmd) {
+  modemSerial.println(cmd);
+  Serial.print("发送: ");
+  Serial.println(cmd);
+  delay(500);
+  while (modemSerial.available()) {
+    Serial.write(modemSerial.read());
+  }
+  Serial.println();
+}
+
+// 等待指定响应字符串
+void waitForResponse(const char* expected, unsigned long timeout) {
+  unsigned long start = millis();
+  String resp = "";
+  while (millis() - start < timeout) {
+    while (modemSerial.available()) {
+      char c = modemSerial.read();
+      resp += c;
+      Serial.print(c);
+      if (resp.indexOf(expected) != -1) return;
+    }
+  }
+  Serial.println("[超时未等到响应]");
+}
+
+// 打印串口所有返回
+void readAllAvailable(unsigned long timeout) {
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    while (modemSerial.available()) {
+      Serial.write(modemSerial.read());
+    }
+  }
+}
+
+#define BUTTON_PIN 32
+
+// I2S 麦克风（录音）
+#define I2S_MIC_SD 15
+#define I2S_MIC_WS 19
+#define I2S_MIC_SCK 21
+
+// I2S 扬声器（播放）
+#define I2S_SPK_DOUT 14
+#define I2S_SPK_BCLK 12
+#define I2S_SPK_LRC 13
+
+// 服务器信息 - 4G版本使用公网IP和新端口
+const char* serverIP = "124.223.102.137";  // 公网服务器IP（请修改为实际公网IP）
+const int sessionPort = 8083;  // input_service端口（录音上传）
+const int apiPort = 8000;  // main_service端口（API调用）
+
+bool isRecording = false;
+bool isPlaying = false;
+volatile bool needInterrupt = false;
+bool is4GConnected = false;
+bool isPollingActive = false;  // 标记是否激活轮询状态
+unsigned long pollingStartTime = 0;  // 轮询开始时间
+const unsigned long POLLING_TIMEOUT = 10000;  // 10秒超时
+const unsigned long POLLING_INTERVAL = 1000;   // 1秒轮询间隔
+
+// I2S 配置
+i2s_config_t i2s_mic_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+  .sample_rate = 16000,
+  .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+  .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+  .dma_buf_count = 8,
+  .dma_buf_len = 512,
+  .use_apll = false,
+  .tx_desc_auto_clear = false,
+  .fixed_mclk = 0,
+  .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+  .bits_per_chan = I2S_BITS_PER_CHAN_16BIT,
+};
+
+i2s_config_t i2s_spk_config = {
+  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+  .sample_rate = 16000,
+  .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+  .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+  .dma_buf_count = 8,
+  .dma_buf_len = 512,
+  .use_apll = false,
+  .tx_desc_auto_clear = true,
+  .fixed_mclk = 0,
+  .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+  .bits_per_chan = I2S_BITS_PER_CHAN_16BIT,
+};
+
+i2s_pin_config_t mic_pins = {
+  .mck_io_num = I2S_PIN_NO_CHANGE,
+  .bck_io_num = I2S_MIC_SCK,
+  .ws_io_num = I2S_MIC_WS,
+  .data_out_num = I2S_PIN_NO_CHANGE,
+  .data_in_num = I2S_MIC_SD
+};
+
+i2s_pin_config_t spk_pins = {
+  .mck_io_num = I2S_PIN_NO_CHANGE,
+  .bck_io_num = I2S_SPK_BCLK,
+  .ws_io_num = I2S_SPK_LRC,
+  .data_out_num = I2S_SPK_DOUT,
+  .data_in_num = I2S_PIN_NO_CHANGE
+};
+
+// BLE相关变量
+BLEAdvertising* pAdvertising;
+TaskHandle_t bleTaskHandle = NULL;
+bool bleEnabled = true;
+
+String getMACAddress() {
+  uint64_t chipId = ESP.getEfuseMac();
+  uint8_t mac[6];
+  mac[0] = 0x02;
+  mac[1] = (chipId >> 32) & 0xFF;
+  mac[2] = (chipId >> 24) & 0xFF;
+  mac[3] = (chipId >> 16) & 0xFF;
+  mac[4] = (chipId >> 8) & 0xFF;
+  mac[5] = chipId & 0xFF;
+  
+  char macStr[18] = { 0 };
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr);
+}
+
+void setupI2S() {
+  // 设置麦克风I2S
+  esp_err_t result = i2s_driver_install(I2S_NUM_0, &i2s_mic_config, 0, NULL);
+  if (result == ESP_OK) {
+    Serial.println("✅ 麦克风I2S驱动安装成功");
+  } else {
+    Serial.printf("❌ 麦克风I2S驱动安装失败, 错误码: %d\n", result);
+  }
+  
+  result = i2s_set_pin(I2S_NUM_0, &mic_pins);
+  if (result == ESP_OK) {
+    Serial.println("✅ 麦克风I2S引脚设置成功");
+  } else {
+    Serial.printf("❌ 麦克风I2S引脚设置失败, 错误码: %d\n", result);
+  }
+  
+  // 设置扬声器I2S
+  esp_err_t spkResult = i2s_driver_install(I2S_NUM_1, &i2s_spk_config, 0, NULL);
+  if (spkResult == ESP_OK) {
+    Serial.println("✅ 扬声器I2S驱动安装成功");
+  } else {
+    Serial.printf("❌ 扬声器I2S驱动安装失败, 错误码: %d\n", spkResult);
+  }
+  
+  spkResult = i2s_set_pin(I2S_NUM_1, &spk_pins);
+  if (spkResult == ESP_OK) {
+    Serial.println("✅ 扬声器I2S引脚设置成功");
+  } else {
+    Serial.printf("❌ 扬声器I2S引脚设置失败, 错误码: %d\n", spkResult);
+  }
+}
+
+// 4G模块初始化 - 建立到input_service和main_service的连接
+bool init4G() {
+  Serial.println("🔧 开始初始化4G模块...");
+  
+  // 基础4G模块初始化 AT 指令序列
+  sendATCommand("AT"); // 测试模块是否响应
+  sendATCommand("ATE0"); // 关闭命令回显
+  sendATCommand("AT+CPIN?"); // 查询 SIM 卡状态
+  sendATCommand("AT+CEREG?"); // 查询网络注册状态
+  sendATCommand("AT+CSQ"); // 查询信号强度
+  sendATCommand("AT+CGSN"); // 查询模块序列号（IMEI）
+  sendATCommand("AT+COPS?"); // 查询当前运营商
+  sendATCommand("AT+CGPADDR"); // 查询PDP激活状态及分配的IP地址
+  
+  // 建立到input_service的TCP连接 (Socket 0)
+  Serial.println("🔗 建立到input_service的连接...");
+  String connectCmd0 = "AT+MIPOPEN=0,\"TCP\",\"" + String(serverIP) + "\"," + String(sessionPort);
+  sendATCommand(connectCmd0.c_str());
+  waitForResponse("+MIPOPEN: 0,0", 10000); // 等待连接成功
+  
+  // 建立到main_service的TCP连接 (Socket 1) 用于API调用
+  Serial.println("🔗 建立到main_service的连接...");
+  String connectCmd1 = "AT+MIPOPEN=1,\"TCP\",\"" + String(serverIP) + "\"," + String(apiPort);
+  sendATCommand(connectCmd1.c_str());
+  waitForResponse("+MIPOPEN: 1,0", 10000); // 等待连接成功
+  
+  Serial.println("✅ 4G模块初始化完成");
+  is4GConnected = true;
+  return true;
+}
+
+// 4G协议：发送会话开始信号
+void sendSessionStart() {
+  if (!is4GConnected) return;
+  
+  String mac = getMACAddress();
+  String sessionMsg = "SESSION_START:" + mac;
+  
+  String sendCmd = "AT+MIPSEND=0," + String(sessionMsg.length());
+  modemSerial.println(sendCmd);
+  delay(100);
+  modemSerial.print(sessionMsg);
+  
+  Serial.println("📤 已发送会话开始信号: " + sessionMsg);
+}
+
+// 4G协议：流式发送音频数据到input_service
+void sendAudioData(const uint8_t* data, size_t length) {
+  if (!is4GConnected) return;
+  
+  String sendCmd = "AT+MIPSEND=0," + String(length);
+  modemSerial.println(sendCmd);
+  delay(50);
+  
+  // 发送音频数据
+  modemSerial.write(data, length);
+  
+  // 等待发送完成
+  unsigned long start = millis();
+  while (millis() - start < 2000) {
+    if (modemSerial.available()) {
+      String response = modemSerial.readString();
+      if (response.indexOf("+MIPSEND: 0") != -1) {
+        return;
+      }
+    }
+  }
+}
+
+// 4G协议：发送录音完成信号
+void sendRecordingComplete() {
+  if (!is4GConnected) return;
+  
+  String completeMsg = "RECORDING_COMPLETE";
+  String sendCmd = "AT+MIPSEND=0," + String(completeMsg.length());
+  modemSerial.println(sendCmd);
+  delay(100);
+  modemSerial.print(completeMsg);
+  
+  Serial.println("📤 已发送录音完成信号");
+}
+
+// 激活轮询机制
+void activatePolling() {
+  isPollingActive = true;
+  pollingStartTime = millis();
+  Serial.println("🔄 激活音频轮询机制");
+}
+
+// 停止轮询机制
+void stopPolling() {
+  isPollingActive = false;
+  pollingStartTime = 0;
+  Serial.println("⏹️ 停止音频轮询机制");
+}
+
+// 检查轮询超时
+bool isPollingTimeout() {
+  if (!isPollingActive) return false;
+  return (millis() - pollingStartTime) > POLLING_TIMEOUT;
+}
+
+// 4G协议：HTTP API调用请求音频 (改进版)
+void requestAudioFromAPI() {
+  if (!is4GConnected || !isPollingActive) return;
+  
+  // 检查轮询超时
+  if (isPollingTimeout()) {
+    Serial.println("⏰ 轮询超时10秒，自动停止轮询");
+    stopPolling();
+    return;
+  }
+  
+  String mac = getMACAddress();
+  
+  // 构建HTTP POST请求到main_service的4G API
+  String httpRequest = "POST /api/4g/request_audio?mac=" + mac + " HTTP/1.1\r\n";
+  httpRequest += "Host: " + String(serverIP) + ":" + String(apiPort) + "\r\n";
+  httpRequest += "Content-Length: 0\r\n";
+  httpRequest += "Connection: keep-alive\r\n\r\n";
+  
+  String sendCmd = "AT+MIPSEND=1," + String(httpRequest.length());
+  modemSerial.println(sendCmd);
+  delay(100);
+  modemSerial.print(httpRequest);
+  
+  // 读取HTTP响应
+  delay(1000);
+  String httpResponse = "";
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    if (modemSerial.available()) {
+      httpResponse += modemSerial.readString();
+    }
+  }
+  
+  // 解析JSON响应
+  if (httpResponse.indexOf("\"status\":\"audio_data\"") != -1) {
+    // 找到音频数据
+    int audioStart = httpResponse.indexOf("\"audio\":\"") + 9;
+    int audioEnd = httpResponse.indexOf("\"", audioStart);
+    if (audioStart > 8 && audioEnd > audioStart) {
+      String audioBase64 = httpResponse.substring(audioStart, audioEnd);
+      
+      Serial.println("🔊 收到音频数据，开始播放...");
+      isPlaying = true;
+      
+      // 解码并播放音频
+      playAudioBase64(audioBase64);
+      
+      // 检查是否是最后一段音频
+      if (httpResponse.indexOf("\"final\":true") != -1) {
+        Serial.println("✅ 收到完成标记，所有音频播放完成");
+        stopPolling(); // 收到完成标记，停止轮询
+        isPlaying = false;
+      } else {
+        Serial.println("➡️ 还有更多音频，继续轮询...");
+      }
+    }
+  } else if (httpResponse.indexOf("\"status\":\"no_audio\"") != -1) {
+    // 暂无音频，继续等待
+    Serial.println("⏳ 服务器音频处理中...");
+  }
+}
+
+// Base64解码表
+const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Base64解码函数
+int base64_decode(const String& encoded, uint8_t* output, int maxLen) {
+  int len = encoded.length();
+  int i = 0, j = 0;
+  uint8_t char_array_4[4], char_array_3[3];
+  
+  while (i < len && encoded[i] != '=') {
+    if (j == 4) {
+      for (int k = 0; k < 4; k++) {
+        char pos = strchr(base64_chars, char_array_4[k]) - base64_chars;
+        char_array_4[k] = pos;
+      }
+      
+      char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+      char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+      char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+      
+      if (j - 3 + 3 > maxLen) break;
+      memcpy(output + j - 3, char_array_3, 3);
+      j = 0;
+    }
+    
+    char_array_4[j++] = encoded[i++];
+  }
+  
+  if (j) {
+    for (int k = j; k < 4; k++) char_array_4[k] = 0;
+    for (int k = 0; k < 4; k++) {
+      char pos = strchr(base64_chars, char_array_4[k]) - base64_chars;
+      char_array_4[k] = pos;
+    }
+    
+    char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+    char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+    char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+    
+    for (int k = 0; k < j - 1; k++) {
+      if (j + k > maxLen) break;
+      output[j + k] = char_array_3[k];
+    }
+  }
+  
+  return j;
+}
+
+// 完整的Base64音频播放实现
+void playAudioBase64(String audioBase64) {
+  Serial.println("🎵 开始解码并播放音频片段，Base64长度: " + String(audioBase64.length()));
+  
+  // 计算解码后的数据大小（大概是原长度的3/4）
+  int decodedSize = (audioBase64.length() * 3) / 4;
+  uint8_t* audioData = (uint8_t*)malloc(decodedSize);
+  
+  if (!audioData) {
+    Serial.println("❌ 内存分配失败");
+    return;
+  }
+  
+  // Base64解码
+  int actualSize = base64_decode(audioBase64, audioData, decodedSize);
+  Serial.printf("✅ Base64解码完成，实际大小: %d bytes\n", actualSize);
+  
+  // 通过I2S播放音频
+  const int chunkSize = 512;
+  int bytesPlayed = 0;
+  
+  while (bytesPlayed < actualSize && !needInterrupt) {
+    int remainingBytes = actualSize - bytesPlayed;
+    int currentChunkSize = (remainingBytes > chunkSize) ? chunkSize : remainingBytes;
+    
+    size_t bytesWritten;
+    esp_err_t result = i2s_write(I2S_NUM_1, audioData + bytesPlayed, currentChunkSize, &bytesWritten, portMAX_DELAY);
+    
+    if (result == ESP_OK) {
+      bytesPlayed += bytesWritten;
+    } else {
+      Serial.printf("❌ I2S写入失败, 错误码: %d\n", result);
+      break;
+    }
+    
+    // 检查中断标志
+    if (needInterrupt) {
+      Serial.println("⚠️ 音频播放被中断");
+      break;
+    }
+    
+    delay(1); // 稍微延迟避免看门狗重置
+  }
+  
+  free(audioData);
+  Serial.println("✅ 音频片段播放完成");
+}
+
+// 4G协议：发送中断信号
+void sendInterruptSignal() {
+  if (!is4GConnected) return;
+  
+  String mac = getMACAddress();
+  
+  // 通过HTTP API发送中断请求
+  String httpRequest = "POST /api/4g/interrupt?mac=" + mac + " HTTP/1.1\r\n";
+  httpRequest += "Host: " + String(serverIP) + ":" + String(apiPort) + "\r\n";
+  httpRequest += "Content-Length: 0\r\n";
+  httpRequest += "Connection: keep-alive\r\n\r\n";
+  
+  String sendCmd = "AT+MIPSEND=1," + String(httpRequest.length());
+  modemSerial.println(sendCmd);
+  delay(100);
+  modemSerial.print(httpRequest);
+  
+  Serial.println("📤 已发送中断信号到服务器");
+}
+
+void setupBLE() {
+  if (!bleEnabled) {
+    Serial.println("ℹ️ BLE功能已禁用");
+    return;
+  }
+  
+  Serial.println("🔧 初始化BLE...");
+  
+  String deviceName = "ESP32_Audio_" + getMACAddress().substring(12);
+  deviceName.replace(":", "");
+  
+  BLEDevice::init(deviceName.c_str());
+  Serial.printf("✅ BLE设备初始化完成，设备名: %s\n", deviceName.c_str());
+  
+  xTaskCreatePinnedToCore(
+    bleTask,
+    "BLETask",
+    4000,
+    NULL,
+    1,
+    &bleTaskHandle,
+    1
+  );
+  
+  Serial.println("🚀 BLE任务已在核心1启动");
+}
+
+void bleTask(void* parameter) {
+  Serial.println("📶 BLE任务启动在核心1");
+  
+  uint8_t beaconData[25] = {
+    0x4C, 0x00,
+    0x02, 0x15,
+    0x12, 0x34, 0x56, 0x78,
+    0x12, 0x34,
+    0x12, 0x34,
+    0x12, 0x34,
+    0x12, 0x34, 0x56, 0x78, 0x90, 0xAB,
+    0x03, 0xE9,
+    0x00, 0x2A,
+    0xC5
+  };
+
+  BLEAdvertisementData advData;
+  advData.setFlags(0x04);
+  advData.setManufacturerData(String((char*)beaconData, 25)); 
+  
+  pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setAdvertisementType(ADV_TYPE_NONCONN_IND);
+  pAdvertising->setMinInterval(1600);
+  pAdvertising->setMaxInterval(1600);
+  pAdvertising->setAdvertisementData(advData);
+  pAdvertising->start();
+  
+  Serial.println("✅ BLE iBeacon广播已启动");
+  
+  while (bleEnabled) {
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+  
+  if (pAdvertising) {
+    pAdvertising->stop();
+    Serial.println("🛑 BLE广播已停止");
+  }
+  
+  bleTaskHandle = NULL;
+  Serial.println("📴 BLE任务已结束");
+  vTaskDelete(NULL);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n====== ESP32语音助手(4G版)启动中 ======");
+  
+  // 1. 初始化4G模块
+  modemSerial.begin(BAUD_RATE, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(3000);
+  
+  if (!init4G()) {
+    Serial.println("❌ 4G连接失败，系统无法启动");
+    while(1);
+  }
+
+  // 2. 初始化文件系统
+  if(SPIFFS.begin(true)) {
+    Serial.println("✅ SPIFFS初始化成功");
+  } else {
+    Serial.println("❌ SPIFFS初始化失败");
+  }
+  
+  // 3. 初始化I2S
+  setupI2S();
+  
+  // 4. 初始化BLE
+  setupBLE();
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  Serial.println("✅ 按钮初始化完成");
+  
+  Serial.println("\n🚀 ESP32语音助手(4G版)已启动");
+  Serial.println("- 按下按钮开始录音（流式传输）");
+  Serial.println("- 松开按钮结束录音并等待音频");
+  Serial.println("- 按下按钮可中断播放并清除服务端队列");
+  Serial.println("- BLE iBeacon广播已启用");
+  Serial.println("- 保持原有流式传输，优化请求机制");
+  Serial.println("====================================");
+}
+
+void loop() {
+  // 按钮处理逻辑
+  static bool lastButtonState = HIGH;
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+  
+  if (currentButtonState != lastButtonState) {
+    delay(50); // 防抖动
+    if (digitalRead(BUTTON_PIN) == currentButtonState) {
+      if (currentButtonState == LOW) {
+        Serial.println("\n🔘 按钮按下");
+        if (isPlaying || isPollingActive) {
+          // 中断播放和轮询
+          Serial.println("⚠️ 强制停止播放和轮询...");
+          sendInterruptSignal(); // 发送中断信号到服务器
+          stopPolling(); // 停止轮询
+          isPlaying = false;
+          needInterrupt = true; // 设置中断标志
+          Serial.println("✅ 播放已停止，等待新录音");
+        } else {
+          // 开始录音 - 4G协议流程
+          sendSessionStart(); // 发送会话开始信号
+          isRecording = true;
+          needInterrupt = false; // 清除中断标志
+          Serial.println("🎤 开始录音（4G流式传输）...");
+        }
+      } else {
+        Serial.println("\n🔘 按钮释放");
+        if (isRecording) {
+          // 停止录音并激活轮询 - 4G协议流程
+          sendRecordingComplete(); // 发送录音完成信号
+          isRecording = false;
+          activatePolling(); // 激活轮询机制
+          Serial.println("🛑 停止录音，激活音频轮询...");
+        }
+      }
+    }
+    lastButtonState = currentButtonState;
+  }
+  
+  // 4G协议：流式录音数据处理
+  if (isRecording && is4GConnected) {
+    uint8_t buffer[512];
+    size_t bytesRead;
+    esp_err_t readResult = i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytesRead, 0);
+    if (readResult == ESP_OK && bytesRead > 0) {
+      sendAudioData(buffer, bytesRead); // 流式发送到input_service
+    }
+  }
+  
+  // 4G协议：激活轮询音频请求逻辑
+  static unsigned long lastRequestTime = 0;
+  if (isPollingActive && !isRecording && 
+      millis() - lastRequestTime > POLLING_INTERVAL) { // 按轮询间隔请求
+    requestAudioFromAPI(); // 使用HTTP API请求音频
+    lastRequestTime = millis();
+  }
+  
+  delay(10); // 稍微增加延迟，减少CPU占用
+}
